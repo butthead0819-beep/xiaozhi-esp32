@@ -15,12 +15,47 @@
 #include <driver/gpio.h>
 #include <esp_log.h>
 #include <arpa/inet.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <cJSON.h>
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 
 #define TAG "Application"
+
+namespace {
+constexpr const char* kMarvinDuckHost = "172.20.10.1";
+constexpr uint16_t kMarvinDuckPort = 47800;
+int s_marvin_duck_sock = -1;
+int s_marvin_duck_seq = 0;
+bool s_marvin_is_ducked = false;
+
+void SendMarvinDuckUdp(bool duck) {
+    if (s_marvin_duck_sock < 0) {
+        s_marvin_duck_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (s_marvin_duck_sock < 0) {
+            ESP_LOGW(TAG, "Failed to create Marvin duck UDP socket");
+            return;
+        }
+    }
+    ++s_marvin_duck_seq;
+    char payload[64];
+    int len = snprintf(payload, sizeof(payload), "{\"cmd\":\"%s\",\"seq\":%d}",
+                       duck ? "duck" : "unduck", s_marvin_duck_seq);
+    if (len <= 0 || len >= static_cast<int>(sizeof(payload))) {
+        return;
+    }
+    struct sockaddr_in dest_addr = {};
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(kMarvinDuckPort);
+    inet_pton(AF_INET, kMarvinDuckHost, &dest_addr.sin_addr.s_addr);
+    int err = sendto(s_marvin_duck_sock, payload, len, MSG_DONTWAIT,
+                     reinterpret_cast<struct sockaddr*>(&dest_addr), sizeof(dest_addr));
+    ESP_LOGI(TAG, "Marvin UDP %s (seq=%d, ret=%d)", duck ? "duck" : "unduck", s_marvin_duck_seq, err);
+}
+}  // namespace
 
 Application::Application() : notify_player_(audio_service_) {
     event_group_ = xEventGroupCreate();
@@ -1023,6 +1058,15 @@ void Application::HandleStateChangedEvent() {
     // Any state change invalidates a pending deferred listening start;
     // the Listening case below re-arms it when needed.
     pending_listening_start_ = false;
+
+    const bool should_duck = (new_state == kDeviceStateConnecting ||
+                              new_state == kDeviceStateListening ||
+                              new_state == kDeviceStateSpeaking ||
+                              new_state == kDeviceStateNotifying);
+    if (should_duck != s_marvin_is_ducked) {
+        s_marvin_is_ducked = should_duck;
+        SendMarvinDuckUdp(should_duck);
+    }
 
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
